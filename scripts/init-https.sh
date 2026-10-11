@@ -43,7 +43,23 @@ fi
 # 2. Поднимаем приложение с HTTPS-конфигом nginx
 $COMPOSE up -d --build backend frontend nginx
 
-# 3. Убираем временный сертификат и получаем настоящий через webroot
+# 3. Самопроверка: доступен ли путь проверки Let's Encrypt по http://$TARGET
+echo ">> Проверка доступности http://$TARGET/.well-known/acme-challenge/"
+mkdir -p certbot/www/.well-known/acme-challenge
+echo ok > certbot/www/.well-known/acme-challenge/selfcheck
+sleep 3
+if ! curl -fsS -m 10 "http://$TARGET/.well-known/acme-challenge/selfcheck" >/dev/null; then
+  echo "!! http://$TARGET не отвечает. Let's Encrypt не сможет проверить сервер."
+  echo "!! Состояние контейнеров и логи nginx:"
+  $COMPOSE ps
+  $COMPOSE logs --tail=30 nginx
+  echo "!! Проверьте: nginx в статусе Up; порт 80 открыт (ufw и файрвол в панели хостера);"
+  echo "!! порт 80 не занят другим процессом (sudo ss -tlnp | grep :80)."
+  exit 1
+fi
+rm -f certbot/www/.well-known/acme-challenge/selfcheck
+
+# 4. Убираем временный сертификат и получаем настоящий через webroot
 if [[ ! -f "$CONF/renewal/app.conf" ]]; then
   rm -rf "$CONF/live/app"
 fi
@@ -53,7 +69,7 @@ $COMPOSE run --rm --entrypoint certbot certbot certonly \
   "${ID_ARGS[@]}" "${MAIL_ARGS[@]}" \
   --agree-tos --non-interactive --force-renewal
 
-# 4. nginx перечитывает новый сертификат, запускаем автопродление
+# 5. nginx перечитывает новый сертификат, запускаем автопродление
 $COMPOSE exec nginx nginx -s reload
 $COMPOSE up -d certbot
 
