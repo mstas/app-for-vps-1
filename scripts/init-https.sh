@@ -5,8 +5,10 @@
 #   bash scripts/init-https.sh 203.0.113.10    # по указанному IP
 #   bash scripts/init-https.sh demo.example.com you@mail.com   # по домену
 #
-# Для IP выдаётся сертификат на 6 дней (профиль shortlived) — продлевается
-# автоматически контейнером certbot из docker-compose.prod.yml.
+# Сертификат получает certbot в режиме standalone (сам слушает порт 80,
+# nginx на это время остановлен). Дальше продление идёт через webroot
+# контейнером certbot из docker-compose.prod.yml, без остановки nginx.
+# Для IP выдаётся сертификат на 6 дней (профиль shortlived).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -22,55 +24,50 @@ else
   ID_ARGS=(-d "$TARGET")
   echo ">> Сертификат для домена: $TARGET"
 fi
+if [[ -n "$EMAIL" ]]; then MAIL_ARGS=(--email "$EMAIL"); else MAIL_ARGS=(--register-unsafely-without-email); fi
 
-if [[ -n "$EMAIL" ]]; then
-  MAIL_ARGS=(--email "$EMAIL")
-else
-  MAIL_ARGS=(--register-unsafely-without-email)
-fi
+mkdir -p certbot/www "$CONF"
 
-mkdir -p certbot/www "$CONF/live/app"
-
-# 1. Временный самоподписанный сертификат, чтобы nginx смог стартовать на 443
+# Остатки временного сертификата от старой версии скрипта
 if [[ ! -f "$CONF/renewal/app.conf" ]]; then
-  echo ">> Временный сертификат для запуска nginx"
-  openssl req -x509 -nodes -newkey rsa:2048 -days 1 \
-    -keyout "$CONF/live/app/privkey.pem" \
-    -out "$CONF/live/app/fullchain.pem" \
-    -subj "/CN=localhost" 2>/dev/null
+  rm -rf "$CONF/live/app" "$CONF/archive/app" 2>/dev/null || sudo rm -rf "$CONF/live/app" "$CONF/archive/app"
 fi
 
-# 2. Поднимаем приложение с HTTPS-конфигом nginx
-$COMPOSE up -d --build backend frontend nginx
+# 1. Приложение поднимаем, nginx останавливаем — порт 80 нужен certbot
+$COMPOSE up -d --build backend frontend
+$COMPOSE stop nginx >/dev/null 2>&1 || true
+$COMPOSE rm -f nginx >/dev/null 2>&1 || true
 
-# 3. Самопроверка: доступен ли путь проверки Let's Encrypt по http://$TARGET
-echo ">> Проверка доступности http://$TARGET/.well-known/acme-challenge/"
-mkdir -p certbot/www/.well-known/acme-challenge
-echo ok > certbot/www/.well-known/acme-challenge/selfcheck
-sleep 3
-if ! curl -fsS -m 10 "http://$TARGET/.well-known/acme-challenge/selfcheck" >/dev/null; then
-  echo "!! http://$TARGET не отвечает. Let's Encrypt не сможет проверить сервер."
-  echo "!! Состояние контейнеров и логи nginx:"
-  $COMPOSE ps
-  $COMPOSE logs --tail=30 nginx
-  echo "!! Проверьте: nginx в статусе Up; порт 80 открыт (ufw и файрвол в панели хостера);"
-  echo "!! порт 80 не занят другим процессом (sudo ss -tlnp | grep :80)."
+if ss -Htln 'sport = :80' | grep -q .; then
+  echo "!! Порт 80 занят другим процессом:"
+  sudo ss -tlnp 'sport = :80' || true
+  echo "!! Освободите его (например: sudo systemctl disable --now nginx apache2) и запустите снова."
   exit 1
 fi
-rm -f certbot/www/.well-known/acme-challenge/selfcheck
 
-# 4. Убираем временный сертификат и получаем настоящий через webroot
-if [[ ! -f "$CONF/renewal/app.conf" ]]; then
-  rm -rf "$CONF/live/app"
+# 2. Получаем сертификат (уже действующий не перевыпускается)
+if ! $COMPOSE run --rm -p 80:80 --entrypoint certbot certbot certonly \
+      --standalone \
+      --cert-name app \
+      "${ID_ARGS[@]}" "${MAIL_ARGS[@]}" \
+      --agree-tos --non-interactive --keep-until-expiring; then
+  echo
+  echo "!! Сертификат не получен."
+  echo "!! 'Connection refused' или 'Timeout' = порт 80 закрыт снаружи:"
+  echo "!!   sudo ufw allow 80 && sudo ufw allow 443"
+  echo "!!   и откройте 80/443 в файрволе (группах безопасности) в панели хостера."
+  echo "!! После исправления просто запустите скрипт ещё раз."
+  exit 1
 fi
-$COMPOSE run --rm --entrypoint certbot certbot certonly \
-  --webroot -w /var/www/certbot \
-  --cert-name app \
-  "${ID_ARGS[@]}" "${MAIL_ARGS[@]}" \
-  --agree-tos --non-interactive --force-renewal
 
-# 5. nginx перечитывает новый сертификат, запускаем автопродление
-$COMPOSE exec nginx nginx -s reload
-$COMPOSE up -d certbot
-
-echo ">> Готово: https://$TARGET"
+# 3. Запускаем nginx с HTTPS и контейнер автопродления
+$COMPOSE up -d nginx certbot
+sleep 2
+code=$(curl -sk -o /dev/null -w '%{http_code}' https://127.0.0.1/api/health || true)
+if [[ "$code" == "200" ]]; then
+  echo ">> Готово: https://$TARGET"
+else
+  echo "!! HTTPS ответил кодом '$code'. Логи nginx:"
+  $COMPOSE logs --tail=30 nginx
+  exit 1
+fi
