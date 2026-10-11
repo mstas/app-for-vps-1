@@ -37,3 +37,21 @@ cd frontend && npm install && npm start
 ```bash
 cd backend && mvn test
 ```
+
+## HTTPS на VPS (без домена)
+
+Let's Encrypt выдаёт сертификаты на IP-адрес (срок 6 дней, продлевается автоматически).
+На сервере, в папке проекта:
+
+```bash
+bash scripts/init-https.sh            # IP определится сам
+# или: bash scripts/init-https.sh 203.0.113.10
+```
+
+Дальше запуск/обновление всегда с прод-надстройкой:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
+```
+
+Появится домен — тот же скрипт: `bash scripts/init-https.sh demo.example.com you@mail.com`.
